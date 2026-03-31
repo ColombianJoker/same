@@ -192,6 +192,13 @@ if __name__ == "__main__":
             help="Show files with the same hash",
             default=False,
         )
+        parser.add_option(
+            "-p",
+            "--parsable",
+            action="store_true",
+            help="Show the list in parsable format",
+            default=False,
+        )
 
         (Options, Args) = parser.parse_args()
         Options.prg_name = PRG_NAME
@@ -232,6 +239,29 @@ if __name__ == "__main__":
                         file=sys.stderr,
                     )
 
+            # --- CONSOLIDATED LISTING ---
+            for s_obj in MasterList:
+                for alg_name in s_obj.algs():
+                    # Get the internal dict for this algorithm: {hash: [files]}
+                    alg_results = s_obj.hashes[alg_name]
+
+                    if not Options.parsable:
+                        print(f"\n{alg_name}:")
+
+                    for hash_val, file_list in alg_results.items():
+                        # If --duplicated is set, skip hashes with only one file
+                        if Options.duplicated and len(file_list) < 2:
+                            continue
+
+                        if Options.parsable:
+                            # Format: ALGO:HASH:filename
+                            for filename in file_list:
+                                print(f"{alg_name}:{hash_val}:{filename}")
+                        else:
+                            # Format: HASH: \n\t filename
+                            print(f"{hash_val}:")
+                            for filename in file_list:
+                                print(f"    {filename}")
     except KeyboardInterrupt:
         sys.stderr.write(f"\n{PRG_NAME}: cancelled!\n")
         sys.stderr.flush()
