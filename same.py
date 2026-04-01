@@ -8,6 +8,7 @@
 
 import hashlib
 import os
+import subprocess
 import sys
 import time
 from optparse import SUPPRESS_HELP, OptionParser
@@ -66,7 +67,6 @@ class Same:
             goal_text = self.file_count + self.progress_bar_count
 
             if self.debug:
-                # {total_info} is a custom placeholder we fill manually to avoid commas
                 fmt = "{desc:<40} |{bar:50}| {total_info}"
                 ncols = 120
             else:
@@ -144,7 +144,6 @@ class Same:
 
         full_path = file_path.expanduser().resolve()
 
-        # Initialize Bar if needed
         if self.verbose and not self._pbar:
             self._init_pbar()
 
@@ -207,17 +206,13 @@ class Same:
             if path_str not in self.hashes[alg][digest]:
                 self.hashes[alg][digest].append(path_str)
 
-        # Unified Progress bar update
         if self.verbose:
             self._current_line_count += 1
             self._pbar.update(1)
-
             goal_text = (
                 self.file_count - self._current_line_count
             ) + self.progress_bar_count
             counter_str = f"{self.file_count:>5}/{goal_text:>5}"
-
-            # Manual format update to bypass the comma
             self._pbar.bar_format = self._pbar_base_fmt.replace(
                 "{total_info}", counter_str
             )
@@ -235,6 +230,21 @@ class Same:
 def format_duration(seconds):
     h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def execute_command(cmd_template, file_path, replacement_str, ask=False):
+    command = cmd_template.replace(replacement_str, f'"{file_path}"')
+    if ask:
+        sys.stderr.write(f"Execute: {command}? [y/N] ")
+        sys.stderr.flush()
+        answer = sys.stdin.readline().strip().lower()
+        if answer != "y":
+            return
+
+    try:
+        subprocess.run(command, shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"Error executing command: {e}\n")
 
 
 if __name__ == "__main__":
@@ -336,6 +346,31 @@ if __name__ == "__main__":
             default=False,
             help="Recurse into .git",
         )
+
+        # New Options
+        parser.add_option(
+            "-e",
+            "--execute",
+            dest="execute_cmd",
+            action="store",
+            help="Execute command on duplicates",
+        )
+        parser.add_option(
+            "-k",
+            "--ok",
+            dest="ok_cmd",
+            action="store",
+            help="Execute command on duplicates with confirmation",
+        )
+        parser.add_option(
+            "-I",
+            "--replace-string",
+            dest="replace_str",
+            action="store",
+            default="{}",
+            help="Replacement string for commands (default: {})",
+        )
+
         parser.add_option(
             "--DEBUG",
             dest="DEBUG",
@@ -377,16 +412,56 @@ if __name__ == "__main__":
                 results = scanner.hashes[alg_name]
                 if not Options.parsable and results:
                     print(f"\n{alg_name}:")
+
                 for hash_val, file_list in results.items():
-                    if Options.duplicated and len(file_list) < 2:
+                    if len(file_list) < 2 and Options.duplicated:
                         continue
+
+                    # NEW SORTING LOGIC:
+                    # Sort by the length of the filename (basename) ASCENDING.
+                    # The shortest filename (the original) stays at index 0.
+                    # The longer ones (the macOS copies) follow.
+                    sorted_files = sorted(file_list, key=lambda p: len(Path(p).name))
+
+                    # If --duplicated is on, index 0 (shortest) is the master.
+                    # display_list contains only the longer-named duplicates.
+                    display_list = (
+                        sorted_files[1:] if Options.duplicated else sorted_files
+                    )
+
+                    if not display_list:
+                        continue
+
                     if Options.parsable:
-                        for f_name in file_list:
+                        for f_name in display_list:
                             print(f"{alg_name}:{hash_val}:{f_name}")
                     else:
-                        print(f"{hash_val}:")
-                        for f_name in file_list:
-                            print(f"    {f_name}")
+                        if not Options.duplicated:
+                            print(f"{hash_val}:")
+
+                        for f_name in display_list:
+                            if Options.duplicated:
+                                # Output matches: HASH:DUPLICATE_PATH
+                                print(f"{hash_val}:{f_name}")
+                            else:
+                                print(f"    {f_name}")
+
+                            # Execution happens here, one by one, after all hashing is done.
+                            if Options.duplicated:
+                                if Options.execute_cmd:
+                                    execute_command(
+                                        Options.execute_cmd,
+                                        f_name,
+                                        Options.replace_str,
+                                        ask=False,
+                                    )
+                                elif Options.ok_cmd:
+                                    execute_command(
+                                        Options.ok_cmd,
+                                        f_name,
+                                        Options.replace_str,
+                                        ask=True,
+                                    )
 
             if Options.show_time:
                 end_ts = time.time()
