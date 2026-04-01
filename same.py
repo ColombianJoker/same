@@ -2,6 +2,7 @@
 # /// script
 # dependencies = [
 #     "xattr",
+#     "tqdm",
 # ]
 # ///
 
@@ -12,6 +13,8 @@ import time
 from optparse import SUPPRESS_HELP, OptionParser
 from pathlib import Path
 
+from tqdm import tqdm
+
 # Constants
 BAD_ALGORITHM = 255
 BLOCK_SIZE = 64 * 1024
@@ -19,93 +22,77 @@ PRG_NAME = "same"
 
 
 class Same:
-    """
-    Class that walks a directory and calculates (and stores)
-    hashes for all files found in the starting directory trees
-    """
-
-    def __init__(self, path: Path, verbose: bool = False, debug: bool = False):
-        self.path = path
+    def __init__(
+        self, verbose: bool = False, debug: bool = False, progress_width: int = 100
+    ):
         self.verbose = verbose
-        # Structure: { "SHA512": { "hash_value": ["file1", "file2"] } }
         self.hashes = {}
         self.prg_name = PRG_NAME
         self._recursive = False
         self.debug = debug
-        if debug:
-            print(f"Same( '{path}' ) created.", file=sys.stderr)
-
-    def name(self, prg_name: str):
-        """Stores the program name"""
-        self.prg_name = prg_name
+        self.file_count = 0
+        self.progress_width = progress_width
+        self._pbar = None
+        self._current_line_count = 0
 
     def recursive(self, recursive: bool = False):
-        """Sets the recursive mode"""
         self._recursive = recursive
 
     def add_alg(self, algorithm_name: str):
-        """Adds an algorithm and prepares the nested dictionary"""
         alg_key = algorithm_name.upper()
         if alg_key not in self.hashes:
             self.hashes[alg_key] = {}
-            if self.debug:
-                print(f"{alg_key} added", file=sys.stderr)
 
     def algs(self):
-        """Gets the list of algorithms selected"""
         return sorted(list(self.hashes.keys()))
 
-    def walk(self):
-        """
-        Walks object, calculating hashes and storing them in the right list.
-        Handles both single files and directories (optionally recursive).
-        """
-        if not self.path.exists():
+    def _init_pbar(self):
+        if self.verbose and not self._pbar:
+            self._pbar = tqdm(
+                total=self.progress_width,
+                unit="file",
+                leave=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
+                ncols=80,
+            )
+
+    def walk(self, start_path: Path):
+        # Resolve path to handle ~ and relative paths immediately
+        try:
+            start_path = start_path.expanduser().resolve()
+        except (OSError, RuntimeError):
+            # Fallback if resolution fails (e.g. permission on parent)
+            start_path = start_path.expanduser()
+
+        if not start_path.exists():
             if self.verbose:
-                print(f"{self.prg_name}: {self.path} does not exist.", file=sys.stderr)
+                tqdm.write(f"{self.prg_name}: {start_path} does not exist.")
             return
 
-        if self.path.is_file():
-            self._process_file(self.path)
-        elif self.path.is_dir():
+        if start_path.is_file():
+            self._process_file(start_path)
+        elif start_path.is_dir():
             if self._recursive:
-                # Use os.walk for deep recursion
-                for root, _, files in os.walk(self.path):
+                for root, _, files in os.walk(start_path):
                     for name in files:
                         self._process_file(Path(root) / name)
             else:
-                # Process only files in the immediate directory
-                for entry in self.path.iterdir():
+                for entry in start_path.iterdir():
                     if entry.is_file():
                         self._process_file(entry)
 
     def _process_file(self, file_path: Path):
-        """
-        Reads a file once and updates all registered hash algorithms in parallel.
-        This optimizes Disk I/O.
-        """
         algs_to_run = self.algs()
         if not algs_to_run:
             return
 
-        # Initialize hasher objects for each requested algorithm
-        hashers = {}
-        for alg in algs_to_run:
-            try:
-                hashers[alg] = hashlib.new(alg.lower())
-            except ValueError:
-                if self.verbose:
-                    print(
-                        f"{self.prg_name}: Unsupported algorithm {alg}", file=sys.stderr
-                    )
+        # Ensure we are working with an absolute, resolved path for grouping
+        full_path = file_path.expanduser().resolve()
 
-        # Read file block by block, updating all hashers at once
+        hashers = {alg: hashlib.new(alg.lower()) for alg in algs_to_run}
+
         try:
-            with open(file_path, "rb") as f:
-                if self.debug:
-                    print(
-                        f"{self.prg_name}: processing '{file_path}'...", file=sys.stderr
-                    )
+            with open(full_path, "rb") as f:
                 while True:
                     chunk = f.read(BLOCK_SIZE)
                     if not chunk:
@@ -113,70 +100,58 @@ class Same:
                     for hasher in hashers.values():
                         hasher.update(chunk)
 
-            # Extract final digests and store them in the hash dictionary
+            self.file_count += 1
             for alg, hasher in hashers.items():
                 digest = hasher.hexdigest()
                 if digest not in self.hashes[alg]:
                     self.hashes[alg][digest] = []
-                self.hashes[alg][digest].append(str(file_path))
-                if self.debug:
-                    print(f"  {alg}={digest}", file=sys.stderr)
+
+                # Store the absolute string path
+                path_str = str(full_path)
+                if path_str not in self.hashes[alg][digest]:
+                    self.hashes[alg][digest].append(path_str)
+
+            if self.verbose:
+                if not self._pbar:
+                    self._init_pbar()
+                self._pbar.update(1)
+                self._current_line_count += 1
+                if self._current_line_count >= self.progress_width:
+                    self._pbar.close()
+                    self._pbar = None
+                    self._current_line_count = 0
 
         except (PermissionError, OSError) as e:
             if self.verbose:
-                print(
-                    f"{self.prg_name}: Error reading {file_path} - {e}", file=sys.stderr
-                )
+                tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
+
+    def close_pbar(self):
+        if self._pbar:
+            self._pbar.close()
 
 
-def available_algorithms():
-    """Returns available algorithms from hashlib library"""
-    return hashlib.algorithms_available
+def format_duration(seconds: float) -> str:
+    h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def print_available(prg_name: str, verbose: bool = False):
-    """Prints the list of available algorithms"""
-    if verbose:
-        print(f"{prg_name}: Algorithms available:")
-        for alg in sorted(list(available_algorithms())):
-            print(f"  {alg.upper()}")
-
-
-# MAIN
 if __name__ == "__main__":
     try:
         parser = OptionParser(usage="%prog [ --OPTIONS ] DIR ... FILE ...")
         parser.add_option(
-            "-v",
-            "--verbose",
-            dest="verbose",
-            action="store_true",
-            help="Verbose mode",
-            default=False,
+            "-v", "--verbose", dest="verbose", action="store_true", default=False
+        )
+        parser.add_option("-M", "--mode", dest="modes", action="store", default="")
+        parser.add_option(
+            "-r", "--recursive", dest="recursive", action="store_true", default=False
         )
         parser.add_option(
-            "-M",
-            "--mode",
-            dest="modes",
-            action="store",
-            help="Comma separated list of algorithms (e.g. SHA512,MD5)",
-            default="",
+            "-t", "--show-time", dest="show_time", action="store_true", default=False
         )
+        parser.add_option("-d", "--duplicated", action="store_true", default=False)
+        parser.add_option("-p", "--parsable", action="store_true", default=False)
         parser.add_option(
-            "-r",
-            "--recursive",
-            "--recurse",
-            dest="recursive",
-            action="store_true",
-            help="Recurse into directories",
-            default=False,
-        )
-        parser.add_option(
-            "--available",
-            dest="available",
-            action="store_true",
-            help="Lists available algorithms only",
-            default=False,
+            "-w", "--progress-width", dest="progress_width", type="int", default=100
         )
         parser.add_option(
             "--DEBUG",
@@ -185,83 +160,64 @@ if __name__ == "__main__":
             help=SUPPRESS_HELP,
             default=False,
         )
-        parser.add_option(
-            "-d",
-            "--duplicated",
-            action="store_true",
-            help="Show files with the same hash",
-            default=False,
-        )
-        parser.add_option(
-            "-p",
-            "--parsable",
-            action="store_true",
-            help="Show the list in parsable format",
-            default=False,
-        )
 
         (Options, Args) = parser.parse_args()
-        Options.prg_name = PRG_NAME
-        Options.start_time = time.time()
-
-        if Options.available:
-            print_available(Options.prg_name, Options.verbose)
-            sys.exit(0)
-
-        if Options.verbose:
-            st = time.localtime(Options.start_time)
-            print(
-                f"{Options.prg_name}: started at {st[0]:04d}/{st[1]:02d}/{st[2]:02d} "
-                f"{st[3]:02d}:{st[4]:02d}:{st[5]:02d}",
-                file=sys.stderr,
-            )
 
         if len(Args):
-            # Parse requested algorithms
+            start_ts = time.time()
+            if Options.show_time:
+                start_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(start_ts))
+                print(f"{PRG_NAME}: started at {start_str}", file=sys.stderr)
+
+            scanner = Same(
+                verbose=Options.verbose,
+                debug=Options.DEBUG,
+                progress_width=Options.progress_width,
+            )
+
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
+            for alg in requested_algs:
+                scanner.add_alg(alg)
+            scanner.recursive(Options.recursive)
 
-            MasterList = []
             for arg in Args:
-                s_obj = Same(Path(arg), verbose=Options.verbose, debug=Options.DEBUG)
+                # Handle ~ and convert to Path object
+                scanner.walk(Path(arg))
 
-                # Add algorithms and set recursion
-                for alg in requested_algs:
-                    s_obj.add_alg(alg)
-                s_obj.recursive(Options.recursive)
+            scanner.close_pbar()
 
-                # Process the path
-                s_obj.walk()
-                MasterList.append(s_obj)
+            # Output Results
+            for alg_name in scanner.algs():
+                results = scanner.hashes[alg_name]
+                if not Options.parsable and results:
+                    print(f"\n{alg_name}:")
 
-                if Options.DEBUG:
-                    print(
-                        f"{Options.prg_name}: Processed {arg} with {s_obj.algs()}",
-                        file=sys.stderr,
-                    )
+                for hash_val, file_list in results.items():
+                    if Options.duplicated and len(file_list) < 2:
+                        continue
+                    if Options.parsable:
+                        for filename in file_list:
+                            print(f"{alg_name}:{hash_val}:{filename}")
+                    else:
+                        print(f"{hash_val}:")
+                        for filename in file_list:
+                            print(f"    {filename}")
 
-            # --- CONSOLIDATED LISTING ---
-            for s_obj in MasterList:
-                for alg_name in s_obj.algs():
-                    # Get the internal dict for this algorithm: {hash: [files]}
-                    alg_results = s_obj.hashes[alg_name]
+            if Options.show_time:
+                end_ts = time.time()
+                duration = end_ts - start_ts
+                sec_per_file = (
+                    duration / scanner.file_count if scanner.file_count > 0 else 0.0
+                )
+                print(
+                    f"{PRG_NAME}: ended at {time.strftime('%Y:%m:%d %H:%M:%S', time.localtime(end_ts))}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"{PRG_NAME}: took {format_duration(duration)} ({sec_per_file:.3f} sec/file)",
+                    file=sys.stderr,
+                )
 
-                    if not Options.parsable:
-                        print(f"\n{alg_name}:")
-
-                    for hash_val, file_list in alg_results.items():
-                        # If --duplicated is set, skip hashes with only one file
-                        if Options.duplicated and len(file_list) < 2:
-                            continue
-
-                        if Options.parsable:
-                            # Format: ALGO:HASH:filename
-                            for filename in file_list:
-                                print(f"{alg_name}:{hash_val}:{filename}")
-                        else:
-                            # Format: HASH: \n\t filename
-                            print(f"{hash_val}:")
-                            for filename in file_list:
-                                print(f"    {filename}")
     except KeyboardInterrupt:
         sys.stderr.write(f"\n{PRG_NAME}: cancelled!\n")
-        sys.stderr.flush()
+        sys.exit(1)
