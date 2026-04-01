@@ -30,6 +30,7 @@ class Same:
         use_xattr=False,
         store_xattr=False,
         force_xattr=False,
+        check_date=False,
     ):
         self.verbose = verbose
         self.debug = debug
@@ -44,6 +45,7 @@ class Same:
         self.use_xattr = use_xattr or store_xattr or force_xattr
         self.store_xattr = store_xattr or force_xattr
         self.force_xattr = force_xattr
+        self.check_date = check_date
 
     def recursive(self, recursive=False):
         self._recursive = recursive
@@ -57,21 +59,32 @@ class Same:
         return sorted(list(self.hashes.keys()))
 
     def _init_pbar(self):
+        """Starts a new progress bar segment with dynamic width based on debug mode."""
         if self.verbose and not self._pbar:
             segment_total = self.file_count + self.progress_width
+
+            if self.debug:
+                # Original layout: 40-char description + 50-char bar
+                bar_width = 50
+                fmt = "{desc:<40} |{bar:50}| {n_fmt}/{total_fmt}"
+                total_ncols = 120
+            else:
+                # Duplicated width: No description + 100-char bar
+                bar_width = 100
+                fmt = "|{bar:100}| {n_fmt}/{total_fmt}"
+                total_ncols = 120  # Keeping ncols consistent for terminal fit
+
             self._pbar = tqdm(
                 initial=self.file_count,
                 total=segment_total,
                 unit="file",
                 leave=True,
-                ncols=120,  # Overall width of the entire line
-                # bar_format="{desc:<40} {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt}",
-                bar_format="{desc:<40} |{bar:50}| {n_fmt}/{total_fmt}",
+                ncols=total_ncols,
+                bar_format=fmt,
             )
 
     def walk(self, start_path: Path):
         try:
-            # We must expand user first so resolve() has a valid path to work with
             resolved_path = start_path.expanduser().resolve()
         except (OSError, RuntimeError):
             resolved_path = start_path.expanduser()
@@ -93,21 +106,21 @@ class Same:
                     if entry.is_file():
                         self._process_file(entry)
 
-    def _get_xattr_hash(self, file_path, alg):
-        attr_name = f"user.{self.prg_name}-hash.{alg.lower()}"
+    def _get_xattr(self, file_path, alg, suffix="hash"):
+        attr_name = f"user.{self.prg_name}-{suffix}.{alg.lower()}"
         try:
             val = xattr.getxattr(str(file_path), attr_name)
             return val.decode("utf-8")
         except (IOError, OSError):
             return None
 
-    def _set_xattr_hash(self, file_path, alg, digest):
-        attr_name = f"user.{self.prg_name}-hash.{alg.lower()}"
+    def _set_xattr(self, file_path, alg, value, suffix="hash"):
+        attr_name = f"user.{self.prg_name}-{suffix}.{alg.lower()}"
         try:
-            xattr.setxattr(str(file_path), attr_name, digest.encode("utf-8"))
+            xattr.setxattr(str(file_path), attr_name, str(value).encode("utf-8"))
         except (IOError, OSError) as e:
             if self.debug:
-                tqdm.write(f"Debug: Failed to write xattr to {file_path}: {e}")
+                tqdm.write(f"Debug: Failed to write {suffix} xattr to {file_path}: {e}")
 
     def _process_file(self, file_path: Path):
         algs_to_run = self.algs()
@@ -115,6 +128,9 @@ class Same:
             return
 
         full_path = file_path.expanduser().resolve()
+
+        # Get file modification time if date checking is enabled
+        current_mtime = full_path.stat().st_mtime if self.check_date else 0
 
         if self.verbose:
             if not self._pbar:
@@ -128,11 +144,26 @@ class Same:
         needed_algs = []
 
         for alg in algs_to_run:
-            cached = None
+            cached_hash = None
+            is_stale = False
+
             if self.use_xattr and not self.force_xattr:
-                cached = self._get_xattr_hash(full_path, alg)
-            if cached:
-                digests[alg] = cached
+                cached_hash = self._get_xattr(full_path, alg, "hash")
+
+                if self.check_date and cached_hash:
+                    cached_date_str = self._get_xattr(full_path, alg, "hash-date")
+                    try:
+                        # If date xattr is missing or older than file, it's stale
+                        if (
+                            not cached_date_str
+                            or float(cached_date_str) < current_mtime
+                        ):
+                            is_stale = True
+                    except ValueError:
+                        is_stale = True
+
+            if cached_hash and not is_stale:
+                digests[alg] = cached_hash
             else:
                 needed_algs.append(alg)
 
@@ -146,11 +177,15 @@ class Same:
                             break
                         for hasher in hashers.values():
                             hasher.update(chunk)
+
                 for alg, hasher in hashers.items():
                     digest = hasher.hexdigest()
                     digests[alg] = digest
                     if self.store_xattr:
-                        self._set_xattr_hash(full_path, alg, digest)
+                        self._set_xattr(full_path, alg, digest, "hash")
+                        if self.check_date:
+                            self._set_xattr(full_path, alg, current_mtime, "hash-date")
+
             except (PermissionError, OSError) as e:
                 if self.verbose:
                     tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
@@ -182,7 +217,6 @@ def format_duration(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-# --- THE MISSING MAIN BLOCK ---
 if __name__ == "__main__":
     try:
         parser = OptionParser(usage="%prog [ --OPTIONS ] DIR ... FILE ...")
@@ -220,6 +254,14 @@ if __name__ == "__main__":
             default=False,
         )
         parser.add_option(
+            "-D",
+            "--date-xattr",
+            dest="check_date",
+            action="store_true",
+            default=False,
+            help="Check if file was modified since hash was stored",
+        )
+        parser.add_option(
             "--DEBUG",
             dest="DEBUG",
             action="store_true",
@@ -242,21 +284,19 @@ if __name__ == "__main__":
                 use_xattr=Options.xattr,
                 store_xattr=Options.store_xattr,
                 force_xattr=Options.force_xattr,
+                check_date=Options.check_date,
             )
 
-            # Setup Algs
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
             for alg in requested_algs:
                 scanner.add_alg(alg)
             scanner.recursive(Options.recursive)
 
-            # Start Walking
             for arg in Args:
                 scanner.walk(Path(arg))
 
             scanner.close_pbar()
 
-            # Output Results
             for alg_name in scanner.algs():
                 results = scanner.hashes[alg_name]
                 if not Options.parsable and results:
