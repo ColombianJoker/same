@@ -19,6 +19,7 @@ from tqdm import tqdm
 # Constants
 BLOCK_SIZE = 64 * 1024
 PRG_NAME = "same"
+SKIP_FILES = {".DS_Store", "Icon\r"}
 
 
 class Same:
@@ -26,11 +27,12 @@ class Same:
         self,
         verbose=False,
         debug=False,
-        progress_width=100,
+        progress_bar_count=100,
         use_xattr=False,
         store_xattr=False,
         force_xattr=False,
         check_date=False,
+        enter_git=False,
     ):
         self.verbose = verbose
         self.debug = debug
@@ -38,7 +40,7 @@ class Same:
         self.prg_name = PRG_NAME
         self._recursive = False
         self.file_count = 0
-        self.progress_width = progress_width
+        self.progress_bar_count = progress_bar_count
         self._pbar = None
         self._current_line_count = 0
 
@@ -46,6 +48,7 @@ class Same:
         self.store_xattr = store_xattr or force_xattr
         self.force_xattr = force_xattr
         self.check_date = check_date
+        self.enter_git = enter_git
 
     def recursive(self, recursive=False):
         self._recursive = recursive
@@ -59,28 +62,27 @@ class Same:
         return sorted(list(self.hashes.keys()))
 
     def _init_pbar(self):
-        """Starts a new progress bar segment with dynamic width based on debug mode."""
         if self.verbose and not self._pbar:
-            segment_total = self.file_count + self.progress_width
+            goal_text = self.file_count + self.progress_bar_count
 
             if self.debug:
-                # Original layout: 40-char description + 50-char bar
-                bar_width = 50
-                fmt = "{desc:<40} |{bar:50}| {n_fmt}/{total_fmt}"
-                total_ncols = 120
+                # {total_info} is a custom placeholder we fill manually to avoid commas
+                fmt = "{desc:<40} |{bar:50}| {total_info}"
+                ncols = 120
             else:
-                # Duplicated width: No description + 100-char bar
-                bar_width = 100
-                fmt = "|{bar:100}| {n_fmt}/{total_fmt}"
-                total_ncols = 120  # Keeping ncols consistent for terminal fit
+                fmt = "|{bar:100}| {total_info}"
+                ncols = 125
+
+            self._pbar_base_fmt = fmt
+            initial_counter = f"{self.file_count}/{goal_text}"
 
             self._pbar = tqdm(
-                initial=self.file_count,
-                total=segment_total,
+                initial=0,
+                total=self.progress_bar_count,
                 unit="file",
                 leave=True,
-                ncols=total_ncols,
-                bar_format=fmt,
+                ncols=ncols,
+                bar_format=self._pbar_base_fmt.replace("{total_info}", initial_counter),
             )
 
     def walk(self, start_path: Path):
@@ -98,7 +100,9 @@ class Same:
             self._process_file(resolved_path)
         elif resolved_path.is_dir():
             if self._recursive:
-                for root, _, files in os.walk(resolved_path):
+                for root, dirs, files in os.walk(resolved_path):
+                    if not self.enter_git and ".git" in dirs:
+                        dirs.remove(".git")
                     for name in files:
                         self._process_file(Path(root) / name)
             else:
@@ -123,22 +127,31 @@ class Same:
                 tqdm.write(f"Debug: Failed to write {suffix} xattr to {file_path}: {e}")
 
     def _process_file(self, file_path: Path):
+        if file_path.name in SKIP_FILES:
+            return
+
+        try:
+            file_stat = file_path.stat()
+            if file_stat.st_size == 0:
+                return
+            current_mtime = file_stat.st_mtime if self.check_date else 0
+        except (OSError, PermissionError):
+            return
+
         algs_to_run = self.algs()
         if not algs_to_run:
             return
 
         full_path = file_path.expanduser().resolve()
 
-        # Get file modification time if date checking is enabled
-        current_mtime = full_path.stat().st_mtime if self.check_date else 0
+        # Initialize Bar if needed
+        if self.verbose and not self._pbar:
+            self._init_pbar()
 
-        if self.verbose:
-            if not self._pbar:
-                self._init_pbar()
-            if self.debug:
-                fname = full_path.name
-                display_name = (fname[:27] + "..") if len(fname) > 30 else fname
-                self._pbar.set_description(f"{display_name}")
+        if self.verbose and self.debug:
+            fname = full_path.name
+            display_name = (fname[:37] + "..") if len(fname) > 39 else fname
+            self._pbar.set_description(display_name)
 
         digests = {}
         needed_algs = []
@@ -146,14 +159,11 @@ class Same:
         for alg in algs_to_run:
             cached_hash = None
             is_stale = False
-
             if self.use_xattr and not self.force_xattr:
                 cached_hash = self._get_xattr(full_path, alg, "hash")
-
                 if self.check_date and cached_hash:
                     cached_date_str = self._get_xattr(full_path, alg, "hash-date")
                     try:
-                        # If date xattr is missing or older than file, it's stale
                         if (
                             not cached_date_str
                             or float(cached_date_str) < current_mtime
@@ -177,7 +187,6 @@ class Same:
                             break
                         for hasher in hashers.values():
                             hasher.update(chunk)
-
                 for alg, hasher in hashers.items():
                     digest = hasher.hexdigest()
                     digests[alg] = digest
@@ -185,7 +194,6 @@ class Same:
                         self._set_xattr(full_path, alg, digest, "hash")
                         if self.check_date:
                             self._set_xattr(full_path, alg, current_mtime, "hash-date")
-
             except (PermissionError, OSError) as e:
                 if self.verbose:
                     tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
@@ -199,10 +207,22 @@ class Same:
             if path_str not in self.hashes[alg][digest]:
                 self.hashes[alg][digest].append(path_str)
 
+        # Unified Progress bar update
         if self.verbose:
-            self._pbar.update(1)
             self._current_line_count += 1
-            if self._current_line_count >= self.progress_width:
+            self._pbar.update(1)
+
+            goal_text = (
+                self.file_count - self._current_line_count
+            ) + self.progress_bar_count
+            counter_str = f"{self.file_count:>5}/{goal_text:>5}"
+
+            # Manual format update to bypass the comma
+            self._pbar.bar_format = self._pbar_base_fmt.replace(
+                "{total_info}", counter_str
+            )
+
+            if self._current_line_count >= self.progress_bar_count:
                 self._pbar.close()
                 self._pbar = None
                 self._current_line_count = 0
@@ -221,22 +241,68 @@ if __name__ == "__main__":
     try:
         parser = OptionParser(usage="%prog [ --OPTIONS ] DIR ... FILE ...")
         parser.add_option(
-            "-v", "--verbose", dest="verbose", action="store_true", default=False
-        )
-        parser.add_option("-M", "--mode", dest="modes", action="store", default="")
-        parser.add_option(
-            "-r", "--recursive", dest="recursive", action="store_true", default=False
-        )
-        parser.add_option(
-            "-t", "--show-time", dest="show_time", action="store_true", default=False
-        )
-        parser.add_option("-d", "--duplicated", action="store_true", default=False)
-        parser.add_option("-p", "--parsable", action="store_true", default=False)
-        parser.add_option(
-            "-w", "--progress-width", dest="progress_width", type="int", default=100
+            "-v",
+            "--verbose",
+            dest="verbose",
+            action="store_true",
+            default=False,
+            help="Enable verbose output",
         )
         parser.add_option(
-            "-x", "--xattr", dest="xattr", action="store_true", default=False
+            "-M",
+            "--mode",
+            dest="modes",
+            action="store",
+            default="",
+            help="Algorithms (e.g., SHA512,MD5)",
+        )
+        parser.add_option(
+            "-r",
+            "--recursive",
+            dest="recursive",
+            action="store_true",
+            default=False,
+            help="Recurse into directories",
+        )
+        parser.add_option(
+            "-t",
+            "--show-time",
+            dest="show_time",
+            action="store_true",
+            default=False,
+            help="Show timing info",
+        )
+        parser.add_option(
+            "-d",
+            "--duplicated",
+            dest="duplicated",
+            action="store_true",
+            default=False,
+            help="Only show duplicates",
+        )
+        parser.add_option(
+            "-p",
+            "--parsable",
+            dest="parsable",
+            action="store_true",
+            default=False,
+            help="Machine-parsable format",
+        )
+        parser.add_option(
+            "-w",
+            "--progress-bar-count",
+            dest="progress_bar_count",
+            type="int",
+            default=100,
+            help=SUPPRESS_HELP,
+        )
+        parser.add_option(
+            "-x",
+            "--xattr",
+            dest="xattr",
+            action="store_true",
+            default=False,
+            help="Read xattrs",
         )
         parser.add_option(
             "-X",
@@ -244,6 +310,7 @@ if __name__ == "__main__":
             dest="store_xattr",
             action="store_true",
             default=False,
+            help="Read/Write xattrs",
         )
         parser.add_option(
             "-y",
@@ -252,6 +319,7 @@ if __name__ == "__main__":
             dest="force_xattr",
             action="store_true",
             default=False,
+            help="Force re-hash",
         )
         parser.add_option(
             "-D",
@@ -259,14 +327,21 @@ if __name__ == "__main__":
             dest="check_date",
             action="store_true",
             default=False,
-            help="Check if file was modified since hash was stored",
+            help="Check file mtime",
+        )
+        parser.add_option(
+            "--enter-git",
+            dest="enter_git",
+            action="store_true",
+            default=False,
+            help="Recurse into .git",
         )
         parser.add_option(
             "--DEBUG",
             dest="DEBUG",
             action="store_true",
-            help=SUPPRESS_HELP,
             default=False,
+            help=SUPPRESS_HELP,
         )
 
         (Options, Args) = parser.parse_args()
@@ -280,11 +355,12 @@ if __name__ == "__main__":
             scanner = Same(
                 verbose=Options.verbose,
                 debug=Options.DEBUG,
-                progress_width=Options.progress_width,
+                progress_bar_count=Options.progress_bar_count,
                 use_xattr=Options.xattr,
                 store_xattr=Options.store_xattr,
                 force_xattr=Options.force_xattr,
                 check_date=Options.check_date,
+                enter_git=Options.enter_git,
             )
 
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
