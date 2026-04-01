@@ -34,6 +34,7 @@ class Same:
         force_xattr=False,
         check_date=False,
         enter_git=False,
+        skip_symlinks=False,
     ):
         self.verbose = verbose
         self.debug = debug
@@ -50,6 +51,7 @@ class Same:
         self.force_xattr = force_xattr
         self.check_date = check_date
         self.enter_git = enter_git
+        self.skip_symlinks = skip_symlinks
 
     def recursive(self, recursive=False):
         self._recursive = recursive
@@ -86,6 +88,12 @@ class Same:
             )
 
     def walk(self, start_path: Path):
+        # Initial check for the path itself if it's a symlink
+        if self.skip_symlinks and start_path.is_symlink():
+            if self.verbose:
+                tqdm.write(f"{self.prg_name}: Skipping symlink {start_path}")
+            return
+
         try:
             resolved_path = start_path.expanduser().resolve()
         except (OSError, RuntimeError):
@@ -103,10 +111,24 @@ class Same:
                 for root, dirs, files in os.walk(resolved_path):
                     if not self.enter_git and ".git" in dirs:
                         dirs.remove(".git")
+
+                    # If skipping links, remove directory links from traversal
+                    if self.skip_symlinks:
+                        dirs[:] = [
+                            d
+                            for d in dirs
+                            if not Path(os.path.join(root, d)).is_symlink()
+                        ]
+
                     for name in files:
-                        self._process_file(Path(root) / name)
+                        file_p = Path(root) / name
+                        if self.skip_symlinks and file_p.is_symlink():
+                            continue
+                        self._process_file(file_p)
             else:
                 for entry in resolved_path.iterdir():
+                    if self.skip_symlinks and entry.is_symlink():
+                        continue
                     if entry.is_file():
                         self._process_file(entry)
 
@@ -235,16 +257,16 @@ def format_duration(seconds):
 def execute_command(cmd_template, file_path, replacement_str, ask=False):
     command = cmd_template.replace(replacement_str, f'"{file_path}"')
     if ask:
-        sys.stderr.write(f"Execute: {command}? [y/N] ")
+        sys.stderr.write(f"{command}? [y/N] ")
         sys.stderr.flush()
         answer = sys.stdin.readline().strip().lower()
-        if answer != "y":
+        if not answer or answer[0] != "y":
             return
 
     try:
         subprocess.run(command, shell=True, check=True)
     except subprocess.CalledProcessError as e:
-        sys.stderr.write(f"Error executing command: {e}\n")
+        sys.stderr.write(f"Error executing: {e}\n")
 
 
 if __name__ == "__main__":
@@ -269,6 +291,7 @@ if __name__ == "__main__":
         parser.add_option(
             "-r",
             "--recursive",
+            "--recurse",
             dest="recursive",
             action="store_true",
             default=False,
@@ -284,6 +307,7 @@ if __name__ == "__main__":
         )
         parser.add_option(
             "-d",
+            "--duplicates",
             "--duplicated",
             dest="duplicated",
             action="store_true",
@@ -293,6 +317,7 @@ if __name__ == "__main__":
         parser.add_option(
             "-p",
             "--parsable",
+            "--parseable",
             dest="parsable",
             action="store_true",
             default=False,
@@ -308,7 +333,7 @@ if __name__ == "__main__":
         )
         parser.add_option(
             "-x",
-            "--xattr",
+            "--use-xattr",
             dest="xattr",
             action="store_true",
             default=False,
@@ -340,14 +365,20 @@ if __name__ == "__main__":
             help="Check file mtime",
         )
         parser.add_option(
+            "-l",
+            "--skip-symlinks",
+            dest="skip_symlinks",
+            action="store_true",
+            default=False,
+            help="Skip over symbolic links",
+        )
+        parser.add_option(
             "--enter-git",
             dest="enter_git",
             action="store_true",
             default=False,
-            help="Recurse into .git",
+            help=SUPPRESS_HELP,
         )
-
-        # New Options
         parser.add_option(
             "-e",
             "--execute",
@@ -368,9 +399,8 @@ if __name__ == "__main__":
             dest="replace_str",
             action="store",
             default="{}",
-            help="Replacement string for commands (default: {})",
+            help=SUPPRESS_HELP,
         )
-
         parser.add_option(
             "--DEBUG",
             dest="DEBUG",
@@ -396,6 +426,7 @@ if __name__ == "__main__":
                 force_xattr=Options.force_xattr,
                 check_date=Options.check_date,
                 enter_git=Options.enter_git,
+                skip_symlinks=Options.skip_symlinks,
             )
 
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
@@ -417,14 +448,8 @@ if __name__ == "__main__":
                     if len(file_list) < 2 and Options.duplicated:
                         continue
 
-                    # NEW SORTING LOGIC:
-                    # Sort by the length of the filename (basename) ASCENDING.
-                    # The shortest filename (the original) stays at index 0.
-                    # The longer ones (the macOS copies) follow.
+                    # Sort by shortest filename first (the original/master)
                     sorted_files = sorted(file_list, key=lambda p: len(Path(p).name))
-
-                    # If --duplicated is on, index 0 (shortest) is the master.
-                    # display_list contains only the longer-named duplicates.
                     display_list = (
                         sorted_files[1:] if Options.duplicated else sorted_files
                     )
@@ -441,26 +466,24 @@ if __name__ == "__main__":
 
                         for f_name in display_list:
                             if Options.duplicated:
-                                # Output matches: HASH:DUPLICATE_PATH
                                 print(f"{hash_val}:{f_name}")
                             else:
                                 print(f"    {f_name}")
 
-                            # Execution happens here, one by one, after all hashing is done.
                             if Options.duplicated:
                                 if Options.execute_cmd:
                                     execute_command(
                                         Options.execute_cmd,
                                         f_name,
                                         Options.replace_str,
-                                        ask=False,
+                                        False,
                                     )
                                 elif Options.ok_cmd:
                                     execute_command(
                                         Options.ok_cmd,
                                         f_name,
                                         Options.replace_str,
-                                        ask=True,
+                                        True,
                                     )
 
             if Options.show_time:
