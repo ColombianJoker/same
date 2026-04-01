@@ -21,6 +21,7 @@ from tqdm import tqdm
 BLOCK_SIZE = 64 * 1024
 PRG_NAME = "same"
 SKIP_FILES = {".DS_Store", "Icon\r"}
+SHAKE_DEFAULT_LENGTH = 64
 
 
 class Same:
@@ -209,7 +210,10 @@ class Same:
                         for hasher in hashers.values():
                             hasher.update(chunk)
                 for alg, hasher in hashers.items():
-                    digest = hasher.hexdigest()
+                    if alg.lower().startswith("shake_"):
+                        digest = hasher.hexdigest(SHAKE_DEFAULT_LENGTH)
+                    else:
+                        digest = hasher.hexdigest()
                     digests[alg] = digest
                     if self.store_xattr:
                         self._set_xattr(full_path, alg, digest, "hash")
@@ -402,6 +406,15 @@ if __name__ == "__main__":
             help=SUPPRESS_HELP,
         )
         parser.add_option(
+            "-L",
+            "--list-algorithms",
+            dest="list_algs",
+            action="store_true",
+            default=False,
+            help="List available hash algorithms and exit",
+        )
+
+        parser.add_option(
             "--DEBUG",
             dest="DEBUG",
             action="store_true",
@@ -410,6 +423,14 @@ if __name__ == "__main__":
         )
 
         (Options, Args) = parser.parse_args()
+        if Options.list_algs:
+            # hashlib.algorithms_available includes many,
+            # guaranteed includes the platform-independent ones.
+            algs = sorted(hashlib.algorithms_available)
+            print("Available algorithms:")
+            for a in algs:
+                print(f"  {a}")
+            sys.exit(0)
 
         if Args:
             start_ts = time.time()
