@@ -41,7 +41,6 @@ class Same:
         self._pbar = None
         self._current_line_count = 0
 
-        # XATTR Flags
         self.use_xattr = use_xattr or store_xattr or force_xattr
         self.store_xattr = store_xattr or force_xattr
         self.force_xattr = force_xattr
@@ -59,8 +58,10 @@ class Same:
 
     def _init_pbar(self):
         if self.verbose and not self._pbar:
+            segment_total = self.file_count + self.progress_width
             self._pbar = tqdm(
-                total=self.progress_width,
+                initial=self.file_count,
+                total=segment_total,
                 unit="file",
                 leave=True,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
@@ -69,24 +70,25 @@ class Same:
 
     def walk(self, start_path: Path):
         try:
-            start_path = start_path.expanduser().resolve()
+            # We must expand user first so resolve() has a valid path to work with
+            resolved_path = start_path.expanduser().resolve()
         except (OSError, RuntimeError):
-            start_path = start_path.expanduser()
+            resolved_path = start_path.expanduser()
 
-        if not start_path.exists():
+        if not resolved_path.exists():
             if self.verbose:
-                tqdm.write(f"{self.prg_name}: {start_path} does not exist.")
+                tqdm.write(f"{self.prg_name}: {resolved_path} does not exist.")
             return
 
-        if start_path.is_file():
-            self._process_file(start_path)
-        elif start_path.is_dir():
+        if resolved_path.is_file():
+            self._process_file(resolved_path)
+        elif resolved_path.is_dir():
             if self._recursive:
-                for root, _, files in os.walk(start_path):
+                for root, _, files in os.walk(resolved_path):
                     for name in files:
                         self._process_file(Path(root) / name)
             else:
-                for entry in start_path.iterdir():
+                for entry in resolved_path.iterdir():
                     if entry.is_file():
                         self._process_file(entry)
 
@@ -113,34 +115,26 @@ class Same:
 
         full_path = file_path.expanduser().resolve()
 
-        # --- NEW DEBUG LOGIC FOR PROGRESS BAR ---
         if self.verbose:
             if not self._pbar:
                 self._init_pbar()
-
             if self.debug:
-                # Truncate filename so it doesn't break the bar layout
                 fname = full_path.name
                 display_name = (fname[:27] + "..") if len(fname) > 30 else fname
-                # self._pbar.set_description(f"Processing: {display_name}")
                 self._pbar.set_description(f"{display_name}")
-        # ----------------------------------------
 
         digests = {}
         needed_algs = []
 
-        # 1. Try to recover from xattrs first if not forced to re-hash
         for alg in algs_to_run:
             cached = None
             if self.use_xattr and not self.force_xattr:
                 cached = self._get_xattr_hash(full_path, alg)
-
             if cached:
                 digests[alg] = cached
             else:
                 needed_algs.append(alg)
 
-        # 2. Calculate hashes for anything not found in xattrs (or if forced)
         if needed_algs:
             hashers = {alg: hashlib.new(alg.lower()) for alg in needed_algs}
             try:
@@ -151,29 +145,24 @@ class Same:
                             break
                         for hasher in hashers.values():
                             hasher.update(chunk)
-
                 for alg, hasher in hashers.items():
                     digest = hasher.hexdigest()
                     digests[alg] = digest
                     if self.store_xattr:
                         self._set_xattr_hash(full_path, alg, digest)
-
             except (PermissionError, OSError) as e:
                 if self.verbose:
                     tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
                 return
 
-        # 3. Record findings
         self.file_count += 1
         for alg, digest in digests.items():
             if digest not in self.hashes[alg]:
                 self.hashes[alg][digest] = []
-
             path_str = str(full_path)
             if path_str not in self.hashes[alg][digest]:
                 self.hashes[alg][digest].append(path_str)
 
-        # Progress bar management
         if self.verbose:
             self._pbar.update(1)
             self._current_line_count += 1
@@ -192,6 +181,7 @@ def format_duration(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+# --- THE MISSING MAIN BLOCK ---
 if __name__ == "__main__":
     try:
         parser = OptionParser(usage="%prog [ --OPTIONS ] DIR ... FILE ...")
@@ -210,15 +200,8 @@ if __name__ == "__main__":
         parser.add_option(
             "-w", "--progress-width", dest="progress_width", type="int", default=100
         )
-
-        # XATTR Options
         parser.add_option(
-            "-x",
-            "--xattr",
-            dest="xattr",
-            action="store_true",
-            default=False,
-            help="Read xattrs",
+            "-x", "--xattr", dest="xattr", action="store_true", default=False
         )
         parser.add_option(
             "-X",
@@ -226,7 +209,6 @@ if __name__ == "__main__":
             dest="store_xattr",
             action="store_true",
             default=False,
-            help="Read/Write xattrs",
         )
         parser.add_option(
             "-y",
@@ -235,9 +217,7 @@ if __name__ == "__main__":
             dest="force_xattr",
             action="store_true",
             default=False,
-            help="Force re-hash and write xattrs",
         )
-
         parser.add_option(
             "--DEBUG",
             dest="DEBUG",
@@ -248,7 +228,7 @@ if __name__ == "__main__":
 
         (Options, Args) = parser.parse_args()
 
-        if len(Args):
+        if Args:
             start_ts = time.time()
             if Options.show_time:
                 start_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(start_ts))
@@ -263,16 +243,19 @@ if __name__ == "__main__":
                 force_xattr=Options.force_xattr,
             )
 
+            # Setup Algs
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
             for alg in requested_algs:
                 scanner.add_alg(alg)
             scanner.recursive(Options.recursive)
 
+            # Start Walking
             for arg in Args:
                 scanner.walk(Path(arg))
 
             scanner.close_pbar()
 
+            # Output Results
             for alg_name in scanner.algs():
                 results = scanner.hashes[alg_name]
                 if not Options.parsable and results:
@@ -302,6 +285,8 @@ if __name__ == "__main__":
                     f"{PRG_NAME}: took {format_duration(duration)} ({sec_per_file:.3f} sec/file)",
                     file=sys.stderr,
                 )
+        else:
+            parser.print_help()
 
     except KeyboardInterrupt:
         sys.stderr.write(f"\n{PRG_NAME}: cancelled!\n")
