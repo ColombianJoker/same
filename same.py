@@ -13,32 +13,43 @@ import time
 from optparse import SUPPRESS_HELP, OptionParser
 from pathlib import Path
 
+import xattr
 from tqdm import tqdm
 
 # Constants
-BAD_ALGORITHM = 255
 BLOCK_SIZE = 64 * 1024
 PRG_NAME = "same"
 
 
 class Same:
     def __init__(
-        self, verbose: bool = False, debug: bool = False, progress_width: int = 100
+        self,
+        verbose=False,
+        debug=False,
+        progress_width=100,
+        use_xattr=False,
+        store_xattr=False,
+        force_xattr=False,
     ):
         self.verbose = verbose
+        self.debug = debug
         self.hashes = {}
         self.prg_name = PRG_NAME
         self._recursive = False
-        self.debug = debug
         self.file_count = 0
         self.progress_width = progress_width
         self._pbar = None
         self._current_line_count = 0
 
-    def recursive(self, recursive: bool = False):
+        # XATTR Flags
+        self.use_xattr = use_xattr or store_xattr or force_xattr
+        self.store_xattr = store_xattr or force_xattr
+        self.force_xattr = force_xattr
+
+    def recursive(self, recursive=False):
         self._recursive = recursive
 
-    def add_alg(self, algorithm_name: str):
+    def add_alg(self, algorithm_name):
         alg_key = algorithm_name.upper()
         if alg_key not in self.hashes:
             self.hashes[alg_key] = {}
@@ -57,11 +68,9 @@ class Same:
             )
 
     def walk(self, start_path: Path):
-        # Resolve path to handle ~ and relative paths immediately
         try:
             start_path = start_path.expanduser().resolve()
         except (OSError, RuntimeError):
-            # Fallback if resolution fails (e.g. permission on parent)
             start_path = start_path.expanduser()
 
         if not start_path.exists():
@@ -81,56 +90,104 @@ class Same:
                     if entry.is_file():
                         self._process_file(entry)
 
+    def _get_xattr_hash(self, file_path, alg):
+        attr_name = f"user.{self.prg_name}-hash.{alg.lower()}"
+        try:
+            val = xattr.getxattr(str(file_path), attr_name)
+            return val.decode("utf-8")
+        except (IOError, OSError):
+            return None
+
+    def _set_xattr_hash(self, file_path, alg, digest):
+        attr_name = f"user.{self.prg_name}-hash.{alg.lower()}"
+        try:
+            xattr.setxattr(str(file_path), attr_name, digest.encode("utf-8"))
+        except (IOError, OSError) as e:
+            if self.debug:
+                tqdm.write(f"Debug: Failed to write xattr to {file_path}: {e}")
+
     def _process_file(self, file_path: Path):
         algs_to_run = self.algs()
         if not algs_to_run:
             return
 
-        # Ensure we are working with an absolute, resolved path for grouping
         full_path = file_path.expanduser().resolve()
 
-        hashers = {alg: hashlib.new(alg.lower()) for alg in algs_to_run}
+        # --- NEW DEBUG LOGIC FOR PROGRESS BAR ---
+        if self.verbose:
+            if not self._pbar:
+                self._init_pbar()
 
-        try:
-            with open(full_path, "rb") as f:
-                while True:
-                    chunk = f.read(BLOCK_SIZE)
-                    if not chunk:
-                        break
-                    for hasher in hashers.values():
-                        hasher.update(chunk)
+            if self.debug:
+                # Truncate filename so it doesn't break the bar layout
+                fname = full_path.name
+                display_name = (fname[:27] + "..") if len(fname) > 30 else fname
+                # self._pbar.set_description(f"Processing: {display_name}")
+                self._pbar.set_description(f"{display_name}")
+        # ----------------------------------------
 
-            self.file_count += 1
-            for alg, hasher in hashers.items():
-                digest = hasher.hexdigest()
-                if digest not in self.hashes[alg]:
-                    self.hashes[alg][digest] = []
+        digests = {}
+        needed_algs = []
 
-                # Store the absolute string path
-                path_str = str(full_path)
-                if path_str not in self.hashes[alg][digest]:
-                    self.hashes[alg][digest].append(path_str)
+        # 1. Try to recover from xattrs first if not forced to re-hash
+        for alg in algs_to_run:
+            cached = None
+            if self.use_xattr and not self.force_xattr:
+                cached = self._get_xattr_hash(full_path, alg)
 
-            if self.verbose:
-                if not self._pbar:
-                    self._init_pbar()
-                self._pbar.update(1)
-                self._current_line_count += 1
-                if self._current_line_count >= self.progress_width:
-                    self._pbar.close()
-                    self._pbar = None
-                    self._current_line_count = 0
+            if cached:
+                digests[alg] = cached
+            else:
+                needed_algs.append(alg)
 
-        except (PermissionError, OSError) as e:
-            if self.verbose:
-                tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
+        # 2. Calculate hashes for anything not found in xattrs (or if forced)
+        if needed_algs:
+            hashers = {alg: hashlib.new(alg.lower()) for alg in needed_algs}
+            try:
+                with open(full_path, "rb") as f:
+                    while True:
+                        chunk = f.read(BLOCK_SIZE)
+                        if not chunk:
+                            break
+                        for hasher in hashers.values():
+                            hasher.update(chunk)
+
+                for alg, hasher in hashers.items():
+                    digest = hasher.hexdigest()
+                    digests[alg] = digest
+                    if self.store_xattr:
+                        self._set_xattr_hash(full_path, alg, digest)
+
+            except (PermissionError, OSError) as e:
+                if self.verbose:
+                    tqdm.write(f"{self.prg_name}: Error reading {full_path} - {e}")
+                return
+
+        # 3. Record findings
+        self.file_count += 1
+        for alg, digest in digests.items():
+            if digest not in self.hashes[alg]:
+                self.hashes[alg][digest] = []
+
+            path_str = str(full_path)
+            if path_str not in self.hashes[alg][digest]:
+                self.hashes[alg][digest].append(path_str)
+
+        # Progress bar management
+        if self.verbose:
+            self._pbar.update(1)
+            self._current_line_count += 1
+            if self._current_line_count >= self.progress_width:
+                self._pbar.close()
+                self._pbar = None
+                self._current_line_count = 0
 
     def close_pbar(self):
         if self._pbar:
             self._pbar.close()
 
 
-def format_duration(seconds: float) -> str:
+def format_duration(seconds):
     h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
@@ -153,6 +210,34 @@ if __name__ == "__main__":
         parser.add_option(
             "-w", "--progress-width", dest="progress_width", type="int", default=100
         )
+
+        # XATTR Options
+        parser.add_option(
+            "-x",
+            "--xattr",
+            dest="xattr",
+            action="store_true",
+            default=False,
+            help="Read xattrs",
+        )
+        parser.add_option(
+            "-X",
+            "--store-xattr",
+            dest="store_xattr",
+            action="store_true",
+            default=False,
+            help="Read/Write xattrs",
+        )
+        parser.add_option(
+            "-y",
+            "-Y",
+            "--always-recreate-xattr",
+            dest="force_xattr",
+            action="store_true",
+            default=False,
+            help="Force re-hash and write xattrs",
+        )
+
         parser.add_option(
             "--DEBUG",
             dest="DEBUG",
@@ -173,6 +258,9 @@ if __name__ == "__main__":
                 verbose=Options.verbose,
                 debug=Options.DEBUG,
                 progress_width=Options.progress_width,
+                use_xattr=Options.xattr,
+                store_xattr=Options.store_xattr,
+                force_xattr=Options.force_xattr,
             )
 
             requested_algs = [a.strip() for a in Options.modes.split(",") if a.strip()]
@@ -181,27 +269,24 @@ if __name__ == "__main__":
             scanner.recursive(Options.recursive)
 
             for arg in Args:
-                # Handle ~ and convert to Path object
                 scanner.walk(Path(arg))
 
             scanner.close_pbar()
 
-            # Output Results
             for alg_name in scanner.algs():
                 results = scanner.hashes[alg_name]
                 if not Options.parsable and results:
                     print(f"\n{alg_name}:")
-
                 for hash_val, file_list in results.items():
                     if Options.duplicated and len(file_list) < 2:
                         continue
                     if Options.parsable:
-                        for filename in file_list:
-                            print(f"{alg_name}:{hash_val}:{filename}")
+                        for f_name in file_list:
+                            print(f"{alg_name}:{hash_val}:{f_name}")
                     else:
                         print(f"{hash_val}:")
-                        for filename in file_list:
-                            print(f"    {filename}")
+                        for f_name in file_list:
+                            print(f"    {f_name}")
 
             if Options.show_time:
                 end_ts = time.time()
