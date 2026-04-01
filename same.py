@@ -64,8 +64,9 @@ class Same:
                 total=segment_total,
                 unit="file",
                 leave=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
-                ncols=80,
+                ncols=120,  # Overall width of the entire line
+                # bar_format="{desc:<40} {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt}",
+                bar_format="{desc:<40} |{bar:50}| {n_fmt}/{total_fmt}",
             )
 
     def walk(self, start_path: Path):
